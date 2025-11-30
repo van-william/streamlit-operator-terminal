@@ -75,6 +75,8 @@ if query_params:
     
     # Work Order
     target_wo = get_param("wo")
+else:
+    target_wo = None
 
 
 # Line Selection

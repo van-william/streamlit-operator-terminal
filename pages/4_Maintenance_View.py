@@ -32,9 +32,7 @@ st.write(f"**Logged in as:** {selected_tech_name}")
 st.subheader("Active Maintenance Calls")
 
 # Auto-refresh for real-time feel
-if st.toggle("Auto-refresh (5s)", value=True):
-    time.sleep(5)
-    st.rerun()
+auto_refresh = st.toggle("Auto-refresh (5s)", value=True)
 
 active_events = get_active_maintenance_events()
 
@@ -87,3 +85,7 @@ else:
             st.divider()
 
 
+# Handle Auto-refresh at the end
+if auto_refresh:
+    time.sleep(5)
+    st.rerun()
