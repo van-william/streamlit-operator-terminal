@@ -135,12 +135,20 @@ wo_options = {}
 wo_default_index = 0
 
 if not wo_df.empty:
-    wo_options = {row["wo_number"]: row["id"] for _, row in wo_df.iterrows()}
+    # Sort: Active first, then Scheduled
+    status_order = {"Active": 0, "Scheduled": 1, "Completed": 2}
+    wo_df['sort_val'] = wo_df['status'].map(lambda x: status_order.get(x, 3))
+    wo_df = wo_df.sort_values(by=['sort_val', 'id'], ascending=[True, False])
+
+    wo_options = {f"{row['wo_number']} - {row['part_number']} ({row['status']})": row["id"] for _, row in wo_df.iterrows()}
     
     # Check URL param for WO here if not set
     if target_wo and not st.session_state.selected_wo_id:
-         if target_wo in wo_options:
-             st.session_state.selected_wo_id = wo_options[target_wo]
+         # Need to find key that contains this WO number
+         for k, v in wo_options.items():
+             if k.startswith(target_wo):
+                 st.session_state.selected_wo_id = v
+                 break
 
     if st.session_state.selected_wo_id:
         current_wo = next((k for k, v in wo_options.items() if v == st.session_state.selected_wo_id), None)

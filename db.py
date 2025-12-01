@@ -55,9 +55,23 @@ def init_db():
             target_quantity INTEGER,
             due_date TEXT,
             line_id INTEGER,
+            status TEXT DEFAULT 'Scheduled',
+            start_date TEXT,
+            completed_date TEXT,
             FOREIGN KEY (line_id) REFERENCES lines(id)
         );
     """)
+
+    # Migration for work_orders status
+    cur.execute("PRAGMA table_info(work_orders)")
+    wo_columns = [col['name'] for col in cur.fetchall()]
+    if 'status' not in wo_columns:
+        try:
+            cur.execute("ALTER TABLE work_orders ADD COLUMN status TEXT DEFAULT 'Scheduled'")
+            cur.execute("ALTER TABLE work_orders ADD COLUMN start_date TEXT")
+            cur.execute("ALTER TABLE work_orders ADD COLUMN completed_date TEXT")
+        except sqlite3.Error as e:
+            print(f"Migration error (work_orders): {e}")
 
     # 3.5 downtime_reasons
     cur.execute("""
@@ -154,6 +168,79 @@ def init_db():
         );
     """)
 
+    # 3.10 safety_incidents
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS safety_incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_id INTEGER,
+            date TEXT NOT NULL,
+            description TEXT,
+            FOREIGN KEY(line_id) REFERENCES lines(id)
+        );
+    """)
+
+    # 3.11 actions
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            line_id INTEGER,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            assigned_to INTEGER,
+            status TEXT NOT NULL,
+            resolution_notes TEXT,
+            FOREIGN KEY(line_id) REFERENCES lines(id),
+            FOREIGN KEY(assigned_to) REFERENCES operators(id)
+        );
+    """)
+
+    # 3.12 targets
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_id INTEGER,
+            metric_type TEXT NOT NULL,
+            target_value REAL,
+            FOREIGN KEY(line_id) REFERENCES lines(id),
+            UNIQUE(line_id, metric_type)
+        );
+    """)
+
+    # 3.13 inspection_records
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS inspection_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_order_id INTEGER,
+            line_id INTEGER,
+            inspector_id INTEGER,
+            result TEXT NOT NULL, 
+            measurements TEXT,
+            timestamp TEXT,
+            notes TEXT,
+            FOREIGN KEY (work_order_id) REFERENCES work_orders(id),
+            FOREIGN KEY (line_id) REFERENCES lines(id),
+            FOREIGN KEY (inspector_id) REFERENCES operators(id)
+        );
+    """)
+
+    # 3.14 mrb_items
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS mrb_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            part_number TEXT,
+            quantity INTEGER,
+            reason TEXT,
+            status TEXT DEFAULT 'Open',
+            disposition TEXT,
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            quality_event_id INTEGER,
+            FOREIGN KEY (quality_event_id) REFERENCES quality_events(id)
+        );
+    """)
+
     conn.commit()
     conn.close()
 
@@ -182,13 +269,16 @@ def get_operators():
     conn.close()
     return df
 
-def get_work_orders(line_id=None):
+def get_work_orders(line_id=None, status=None):
     conn = get_connection()
-    query = "SELECT * FROM work_orders"
+    query = "SELECT * FROM work_orders WHERE 1=1"
     params = []
     if line_id:
-        query += " WHERE line_id = ?"
+        query += " AND line_id = ?"
         params.append(line_id)
+    if status:
+        query += " AND status = ?"
+        params.append(status)
     df = pd.read_sql(query, conn, params=params)
     conn.close()
     return df
@@ -416,6 +506,90 @@ def get_production_summary(start_time_str, end_time_str):
     conn.close()
     return df
 
+def log_safety_incident(line_id, date, description):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO safety_incidents (line_id, date, description) VALUES (?, ?, ?)",
+        (line_id, date, description)
+    )
+    conn.commit()
+    conn.close()
+
+def get_safety_incidents(line_id, start_date, end_date):
+    conn = get_connection()
+    query = "SELECT * FROM safety_incidents WHERE line_id = ? AND date >= ? AND date <= ?"
+    df = pd.read_sql(query, conn, params=(line_id, start_date, end_date))
+    conn.close()
+    return df
+
+def create_action(line_id, category, description, assigned_to):
+    conn = get_connection()
+    cur = conn.cursor()
+    timestamp = datetime.now().isoformat()
+    cur.execute(
+        """
+        INSERT INTO actions (timestamp, line_id, category, description, assigned_to, status)
+        VALUES (?, ?, ?, ?, ?, 'open')
+        """,
+        (timestamp, line_id, category, description, assigned_to)
+    )
+    conn.commit()
+    conn.close()
+
+def get_actions(status=None):
+    conn = get_connection()
+    query = """
+        SELECT a.*, l.name as line_name, o.name as assignee_name 
+        FROM actions a
+        LEFT JOIN lines l ON a.line_id = l.id
+        LEFT JOIN operators o ON a.assigned_to = o.id
+    """
+    params = []
+    if status:
+        query += " WHERE a.status = ?"
+        params.append(status)
+    
+    query += " ORDER BY timestamp DESC"
+    
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    return df
+
+def close_action(action_id, resolution_notes):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE actions SET status = 'closed', resolution_notes = ? WHERE id = ?",
+        (resolution_notes, action_id)
+    )
+    conn.commit()
+    conn.close()
+
+def set_target(line_id, metric_type, value):
+    conn = get_connection()
+    cur = conn.cursor()
+    # Upsert logic (INSERT OR REPLACE)
+    cur.execute(
+        "INSERT OR REPLACE INTO targets (line_id, metric_type, target_value) VALUES (?, ?, ?)",
+        (line_id, metric_type, value)
+    )
+    conn.commit()
+    conn.close()
+
+def get_targets(line_id):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT metric_type, target_value FROM targets WHERE line_id = ?", (line_id,))
+    rows = cur.fetchall()
+    conn.close()
+    
+    # Return a dictionary of targets
+    targets = {}
+    for row in rows:
+        targets[row["metric_type"]] = row["target_value"]
+    return targets
+
 def add_line(name, description=""):
     conn = get_connection()
     cur = conn.cursor()
@@ -444,6 +618,113 @@ def add_downtime_reason(code, description, category):
     conn.commit()
     conn.close()
 
+def create_work_order(wo_number, part_number, target_quantity, due_date, line_id, status="Scheduled"):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO work_orders (wo_number, part_number, target_quantity, due_date, line_id, status)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (wo_number, part_number, target_quantity, due_date, line_id, status)
+    )
+    conn.commit()
+    conn.close()
+
+def update_work_order_status(wo_id, status):
+    conn = get_connection()
+    cur = conn.cursor()
+    update_query = "UPDATE work_orders SET status = ?"
+    params = [status]
+    
+    if status == "Active":
+        update_query += ", start_date = ?"
+        params.append(datetime.now().isoformat())
+    elif status == "Completed":
+        update_query += ", completed_date = ?"
+        params.append(datetime.now().isoformat())
+        
+    update_query += " WHERE id = ?"
+    params.append(wo_id)
+    
+    cur.execute(update_query, params)
+    conn.commit()
+    conn.close()
+
+def get_inspection_records(wo_id=None):
+    conn = get_connection()
+    query = """
+        SELECT i.*, o.name as inspector_name, l.name as line_name, w.wo_number
+        FROM inspection_records i
+        LEFT JOIN operators o ON i.inspector_id = o.id
+        LEFT JOIN lines l ON i.line_id = l.id
+        LEFT JOIN work_orders w ON i.work_order_id = w.id
+    """
+    params = []
+    if wo_id:
+        query += " WHERE i.work_order_id = ?"
+        params.append(wo_id)
+        
+    query += " ORDER BY i.timestamp DESC"
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    return df
+
+def create_inspection_record(work_order_id, line_id, inspector_id, result, measurements="", notes=""):
+    conn = get_connection()
+    cur = conn.cursor()
+    timestamp = datetime.now().isoformat()
+    cur.execute(
+        """
+        INSERT INTO inspection_records (work_order_id, line_id, inspector_id, result, measurements, timestamp, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (work_order_id, line_id, inspector_id, result, measurements, timestamp, notes)
+    )
+    conn.commit()
+    conn.close()
+
+def get_mrb_items(status=None):
+    conn = get_connection()
+    query = "SELECT * FROM mrb_items"
+    params = []
+    if status:
+        query += " WHERE status = ?"
+        params.append(status)
+    query += " ORDER BY created_at DESC"
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    return df
+
+def create_mrb_item(part_number, quantity, reason, notes="", quality_event_id=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    created_at = datetime.now().isoformat()
+    cur.execute(
+        """
+        INSERT INTO mrb_items (part_number, quantity, reason, status, notes, created_at, quality_event_id)
+        VALUES (?, ?, ?, 'Open', ?, ?, ?)
+        """,
+        (part_number, quantity, reason, notes, created_at, quality_event_id)
+    )
+    conn.commit()
+    conn.close()
+
+def update_mrb_disposition(item_id, disposition, notes=""):
+    conn = get_connection()
+    cur = conn.cursor()
+    updated_at = datetime.now().isoformat()
+    cur.execute(
+        """
+        UPDATE mrb_items 
+        SET status = 'Dispositioned', disposition = ?, notes = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (disposition, notes, updated_at, item_id)
+    )
+    conn.commit()
+    conn.close()
+
 def seed_db():
     """Populates the database with initial sample data."""
     conn = get_connection()
@@ -457,8 +738,8 @@ def seed_db():
 
     # Lines
     lines = [
-        ("Line A", "Main Assembly Line"),
-        ("Line B", "Packaging Line"),
+        ("Line_A", "Main Assembly Line"),
+        ("Line_B", "Packaging Line"),
     ]
     cur.executemany("INSERT INTO lines (name, description) VALUES (?, ?)", lines)
     
@@ -470,24 +751,24 @@ def seed_db():
 
     # Machines
     machines = [
-        ("Conveyor 1", line_map["Line A"], "Infeed Conveyor"),
-        ("Robot Arm 1", line_map["Line A"], "Assembly Robot"),
-        ("Packer 1", line_map["Line B"], "Box Packer"),
+        ("Conveyor_1", line_map["Line_A"], "Infeed Conveyor"),
+        ("Robot_Arm_1", line_map["Line_A"], "Assembly Robot"),
+        ("Packer_1", line_map["Line_B"], "Box Packer"),
     ]
     cur.executemany("INSERT INTO machines (name, line_id, description) VALUES (?, ?, ?)", machines)
 
     # Operators
     operators = [
-        ("John Doe", "OP001"),
-        ("Jane Smith", "OP002"),
-        ("Mike Johnson", "OP003"),
+        ("John_Doe", "OP001"),
+        ("Jane_Smith", "OP002"),
+        ("Mike_Johnson", "OP003"),
     ]
     cur.executemany("INSERT INTO operators (name, badge_id) VALUES (?, ?)", operators)
 
     # Work Orders
     work_orders = [
-        ("WO-1001", "PN-A001", 500, "2023-12-31", line_map["Line A"]),
-        ("WO-1002", "PN-B002", 1000, "2023-12-31", line_map["Line B"]),
+        ("WO-1001", "PN-A001", 500, "2023-12-31", line_map["Line_A"]),
+        ("WO-1002", "PN-B002", 1000, "2023-12-31", line_map["Line_B"]),
     ]
     cur.executemany("INSERT INTO work_orders (wo_number, part_number, target_quantity, due_date, line_id) VALUES (?, ?, ?, ?, ?)", work_orders)
 

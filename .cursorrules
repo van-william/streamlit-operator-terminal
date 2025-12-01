@@ -1,0 +1,40 @@
+# Cursor Rules for Andon App
+
+## Project Context
+This is a Streamlit-based Digital Andon & Downtime Tracker application. It is designed for manufacturing environments to track downtime, quality issues, and production counts. It uses a local SQLite database (`andon.db`).
+
+## Code Style & Conventions
+- **Python**: Follow PEP 8 guidelines.
+- **Streamlit**:
+  - Use `st.set_page_config` at the top of every page.
+  - Use `st.cache_data` for expensive data fetching operations.
+  - clear cache when modifying data (`st.cache_data.clear()`).
+  - Use `st.columns` for layout to optimize screen space (tablet-friendly).
+- **Database (`db.py`)**:
+  - All database interactions must go through helper functions in `db.py`.
+  - Always close database connections (use `with` context managers or explicit `conn.close()` in helpers).
+  - Use parameterized queries (`?` placeholder) to prevent SQL injection.
+  - Dates/Times should be stored as ISO 8601 strings (`datetime.isoformat()`).
+- **File Structure**:
+  - `app.py`: Main entry point.
+  - `pages/`: Individual Streamlit pages (numbered for ordering).
+  - `db.py`: Database schema and helper functions.
+  - `config.py`: Configuration constants (Shifts, DB name).
+
+## Specific Patterns
+- **SQDC Dashboards**:
+  - Tier 1: Value Stream SQDC (Line level).
+  - Tier 2: Executive Summary (Aggregated).
+  - Metrics: Safety, Quality (FPY/Scrap), Delivery (vs Plan), Cost (Downtime).
+  - Status Indicators: Green (Target Met) vs Red (Target Missed).
+
+## Database Migration
+- When modifying the schema, update `init_db()` in `db.py`.
+- Use `IF NOT EXISTS` for table creation.
+- Check for column existence before `ALTER TABLE` to ensure idempotency.
+
+## Dependencies
+- `streamlit`
+- `pandas`
+- `sqlite3` (stdlib)
+
