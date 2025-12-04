@@ -11,3 +11,6 @@ SHIFTS = {
 # Database Path
 DB_NAME = "andon.db"
 
+# Grafana Configuration (Default)
+GRAFANA_URL = "http://localhost:3000"
+
