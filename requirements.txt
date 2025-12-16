@@ -4,3 +4,4 @@ altair
 openai
 tavily-python
 psycopg2-binary
+databricks-sdk

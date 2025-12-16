@@ -24,6 +24,12 @@ try:
 except ImportError:  # pragma: no cover - handled at runtime if missing
     psycopg2 = None
 
+# Optional import for Databricks SDK (used for token-based Lakebase auth)
+try:
+    from databricks.sdk import WorkspaceClient
+except ImportError:  # pragma: no cover
+    WorkspaceClient = None
+
 DB_PATH = Path(DB_NAME)
 IS_LAKEBASE = DB_BACKEND == "lakebase"
 
@@ -32,6 +38,19 @@ def _cursor_factory():
     if IS_LAKEBASE and psycopg2:
         return psycopg2.extras.RealDictCursor
     return None
+
+
+def _lakebase_password():
+    """
+    Resolve password for Lakebase.
+    Prefer PGPASSWORD; if absent, fall back to Databricks OAuth token via WorkspaceClient.
+    """
+    if PG_PASSWORD:
+        return PG_PASSWORD
+    if WorkspaceClient is None:
+        raise RuntimeError("PGPASSWORD is missing and databricks-sdk is not installed for token auth.")
+    client = WorkspaceClient()
+    return client.config.oauth_token().access_token
 
 
 def get_connection():
@@ -44,17 +63,17 @@ def get_connection():
             "PGPORT": PG_PORT,
             "PGDATABASE": PG_DATABASE,
             "PGUSER": PG_USER,
-            "PGPASSWORD": PG_PASSWORD,
         }
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise RuntimeError(f"Missing Lakebase environment variables: {', '.join(missing)}")
+        password = _lakebase_password()
         return psycopg2.connect(
             host=PG_HOST,
             port=PG_PORT,
             dbname=PG_DATABASE,
             user=PG_USER,
-            password=PG_PASSWORD,
+            password=password,
             sslmode=PG_SSLMODE,
             application_name=PG_APPNAME,
         )
