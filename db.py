@@ -1,35 +1,178 @@
 import sqlite3
 from pathlib import Path
 from datetime import datetime
+from typing import Any, Iterable, Optional
+
 import pandas as pd
-from config import DB_NAME
+
+from config import (
+    DB_BACKEND,
+    DB_NAME,
+    PG_APPNAME,
+    PG_DATABASE,
+    PG_HOST,
+    PG_PASSWORD,
+    PG_PORT,
+    PG_SSLMODE,
+    PG_USER,
+)
+
+# Optional import for Lakebase (PostgreSQL)
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:  # pragma: no cover - handled at runtime if missing
+    psycopg2 = None
 
 DB_PATH = Path(DB_NAME)
+IS_LAKEBASE = DB_BACKEND == "lakebase"
+
+
+def _cursor_factory():
+    if IS_LAKEBASE and psycopg2:
+        return psycopg2.extras.RealDictCursor
+    return None
+
 
 def get_connection():
-    """Establishes a connection to the SQLite database."""
+    """Establishes a connection to the configured database."""
+    if IS_LAKEBASE:
+        if psycopg2 is None:
+            raise RuntimeError("psycopg2-binary is required for Lakebase support.")
+        required = {
+            "PGHOST": PG_HOST,
+            "PGPORT": PG_PORT,
+            "PGDATABASE": PG_DATABASE,
+            "PGUSER": PG_USER,
+            "PGPASSWORD": PG_PASSWORD,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise RuntimeError(f"Missing Lakebase environment variables: {', '.join(missing)}")
+        return psycopg2.connect(
+            host=PG_HOST,
+            port=PG_PORT,
+            dbname=PG_DATABASE,
+            user=PG_USER,
+            password=PG_PASSWORD,
+            sslmode=PG_SSLMODE,
+            application_name=PG_APPNAME,
+        )
+
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
+
+def _prepare_query(query: str) -> str:
+    """Adjust placeholder style for the active backend."""
+    if IS_LAKEBASE:
+        return query.replace("?", "%s")
+    return query
+
+
+def _read_df(query: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
+    conn = get_connection()
+    sql = _prepare_query(query)
+    df = pd.read_sql(sql, conn, params=params)
+    conn.close()
+    return df
+
+
+def _fetch_one(query: str, params: Optional[Iterable[Any]] = None):
+    conn = get_connection()
+    cursor_kwargs = {}
+    factory = _cursor_factory()
+    if factory:
+        cursor_kwargs["cursor_factory"] = factory
+    cur = conn.cursor(**cursor_kwargs)
+    cur.execute(_prepare_query(query), params or [])
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def _execute(query: str, params: Optional[Iterable[Any]] = None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(_prepare_query(query), params or [])
+    conn.commit()
+    conn.close()
+
+
+def _execute_returning_id(query: str, params: Optional[Iterable[Any]] = None) -> Any:
+    conn = get_connection()
+    cursor_kwargs = {}
+    factory = _cursor_factory()
+    if factory:
+        cursor_kwargs["cursor_factory"] = factory
+    cur = conn.cursor(**cursor_kwargs)
+
+    sql = _prepare_query(query)
+    if IS_LAKEBASE and "returning" not in sql.lower():
+        sql = sql.rstrip().rstrip(";") + " RETURNING id"
+
+    cur.execute(sql, params or [])
+    if IS_LAKEBASE:
+        row = cur.fetchone()
+        if isinstance(row, dict):
+            new_id = row.get("id") or list(row.values())[0]
+        else:
+            new_id = row[0]
+    else:
+        new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def _executemany(query: str, seq_of_params: Iterable[Iterable[Any]]):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.executemany(_prepare_query(query), seq_of_params)
+    conn.commit()
+    conn.close()
+
+
+def _get_columns(cur, table_name: str):
+    if IS_LAKEBASE:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = %s
+            """,
+            (table_name,),
+        )
+        return [row["column_name"] if isinstance(row, dict) else row[0] for row in cur.fetchall()]
+    else:
+        cur.execute(f"PRAGMA table_info({table_name})")
+        return [row["name"] for row in cur.fetchall()]
+
 def init_db():
     """Initializes the database with the required tables."""
     conn = get_connection()
-    cur = conn.cursor()
+    cursor_kwargs = {}
+    factory = _cursor_factory()
+    if factory:
+        cursor_kwargs["cursor_factory"] = factory
+    cur = conn.cursor(**cursor_kwargs)
+
+    pk_type = "SERIAL PRIMARY KEY" if IS_LAKEBASE else "INTEGER PRIMARY KEY AUTOINCREMENT"
 
     # 3.1 lines
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS lines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             name TEXT NOT NULL,
             description TEXT
         );
     """)
 
     # 3.2 machines
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS machines (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             name TEXT NOT NULL,
             line_id INTEGER,
             description TEXT,
@@ -38,18 +181,18 @@ def init_db():
     """)
 
     # 3.3 operators
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS operators (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             name TEXT NOT NULL,
             badge_id TEXT
         );
     """)
 
     # 3.4 work_orders
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS work_orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             wo_number TEXT NOT NULL,
             part_number TEXT,
             target_quantity INTEGER,
@@ -63,20 +206,19 @@ def init_db():
     """)
 
     # Migration for work_orders status
-    cur.execute("PRAGMA table_info(work_orders)")
-    wo_columns = [col['name'] for col in cur.fetchall()]
-    if 'status' not in wo_columns:
+    wo_columns = _get_columns(cur, "work_orders")
+    if "status" not in wo_columns:
         try:
             cur.execute("ALTER TABLE work_orders ADD COLUMN status TEXT DEFAULT 'Scheduled'")
             cur.execute("ALTER TABLE work_orders ADD COLUMN start_date TEXT")
             cur.execute("ALTER TABLE work_orders ADD COLUMN completed_date TEXT")
-        except sqlite3.Error as e:
+        except Exception as e:  # noqa: BLE001
             print(f"Migration error (work_orders): {e}")
 
     # 3.5 downtime_reasons
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS downtime_reasons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             code TEXT NOT NULL,
             description TEXT NOT NULL,
             category TEXT
@@ -84,9 +226,9 @@ def init_db():
     """)
 
     # 3.6 quality_reasons
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS quality_reasons (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             code TEXT NOT NULL,
             description TEXT NOT NULL,
             category TEXT
@@ -94,9 +236,9 @@ def init_db():
     """)
 
     # 3.7 downtime_events
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS downtime_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             machine_id INTEGER,
             line_id INTEGER,
             work_order_id INTEGER,
@@ -119,21 +261,20 @@ def init_db():
     """)
 
     # Migration: Check if columns exist (for existing DB)
-    cur.execute("PRAGMA table_info(downtime_events)")
-    columns = [col['name'] for col in cur.fetchall()]
-    
-    if 'technician_id' not in columns:
+    columns = _get_columns(cur, "downtime_events")
+
+    if "technician_id" not in columns:
         try:
             cur.execute("ALTER TABLE downtime_events ADD COLUMN technician_id INTEGER REFERENCES operators(id)")
             cur.execute("ALTER TABLE downtime_events ADD COLUMN acknowledged_at TEXT")
             cur.execute("ALTER TABLE downtime_events ADD COLUMN resolution_notes TEXT")
-        except sqlite3.Error as e:
-             print(f"Migration error (ignored if columns exist): {e}")
+        except Exception as e:  # noqa: BLE001
+            print(f"Migration error (ignored if columns exist): {e}")
 
     # 3.8 quality_events
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS quality_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             machine_id INTEGER,
             line_id INTEGER,
             work_order_id INTEGER,
@@ -151,9 +292,9 @@ def init_db():
     """)
 
     # 3.9 production_counts
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS production_counts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             machine_id INTEGER,
             line_id INTEGER,
             work_order_id INTEGER,
@@ -169,9 +310,9 @@ def init_db():
     """)
 
     # 3.10 safety_incidents
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS safety_incidents (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             line_id INTEGER,
             date TEXT NOT NULL,
             description TEXT,
@@ -180,9 +321,9 @@ def init_db():
     """)
 
     # 3.11 actions
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS actions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             timestamp TEXT NOT NULL,
             line_id INTEGER,
             category TEXT NOT NULL,
@@ -196,9 +337,9 @@ def init_db():
     """)
 
     # 3.12 targets
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS targets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             line_id INTEGER,
             metric_type TEXT NOT NULL,
             target_value REAL,
@@ -208,9 +349,9 @@ def init_db():
     """)
 
     # 3.13 inspection_records
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS inspection_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             work_order_id INTEGER,
             line_id INTEGER,
             inspector_id INTEGER,
@@ -225,9 +366,9 @@ def init_db():
     """)
 
     # 3.14 mrb_items
-    cur.execute("""
+    cur.execute(f"""
         CREATE TABLE IF NOT EXISTS mrb_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id {pk_type},
             part_number TEXT,
             quantity INTEGER,
             reason TEXT,
@@ -247,30 +388,20 @@ def init_db():
 # --- Helper Functions ---
 
 def get_lines():
-    conn = get_connection()
-    df = pd.read_sql("SELECT * FROM lines", conn)
-    conn.close()
-    return df
+    return _read_df("SELECT * FROM lines")
 
 def get_machines(line_id=None):
-    conn = get_connection()
     query = "SELECT * FROM machines"
     params = []
     if line_id:
         query += " WHERE line_id = ?"
         params.append(line_id)
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 def get_operators():
-    conn = get_connection()
-    df = pd.read_sql("SELECT * FROM operators", conn)
-    conn.close()
-    return df
+    return _read_df("SELECT * FROM operators")
 
 def get_work_orders(line_id=None, status=None):
-    conn = get_connection()
     query = "SELECT * FROM work_orders WHERE 1=1"
     params = []
     if line_id:
@@ -279,93 +410,62 @@ def get_work_orders(line_id=None, status=None):
     if status:
         query += " AND status = ?"
         params.append(status)
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 def get_downtime_reasons():
-    conn = get_connection()
-    df = pd.read_sql("SELECT * FROM downtime_reasons", conn)
-    conn.close()
-    return df
+    return _read_df("SELECT * FROM downtime_reasons")
 
 def get_quality_reasons():
-    conn = get_connection()
-    df = pd.read_sql("SELECT * FROM quality_reasons", conn)
-    conn.close()
-    return df
+    return _read_df("SELECT * FROM quality_reasons")
 
 def create_downtime_event(machine_id, line_id, work_order_id, operator_id, reason_id, notes=""):
-    conn = get_connection()
-    cur = conn.cursor()
     start_time = datetime.now().isoformat()
-    cur.execute(
+    return _execute_returning_id(
         """
         INSERT INTO downtime_events (machine_id, line_id, work_order_id, operator_id, reason_id, start_time, end_time, duration_minutes, notes)
         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?)
         """,
         (machine_id, line_id, work_order_id, operator_id, reason_id, start_time, notes),
     )
-    conn.commit()
-    event_id = cur.lastrowid
-    conn.close()
-    return event_id
 
 def close_downtime_event(event_id):
-    conn = get_connection()
-    cur = conn.cursor()
     end_time = datetime.now()
     
     # Fetch start time to calculate duration
-    cur.execute("SELECT start_time FROM downtime_events WHERE id = ?", (event_id,))
-    row = cur.fetchone()
+    row = _fetch_one("SELECT start_time FROM downtime_events WHERE id = ?", (event_id,))
     
     if row:
         start_time = datetime.fromisoformat(row["start_time"])
         duration = (end_time - start_time).total_seconds() / 60.0
         
-        cur.execute(
+        _execute(
             "UPDATE downtime_events SET end_time = ?, duration_minutes = ? WHERE id = ?",
             (end_time.isoformat(), duration, event_id),
         )
-        conn.commit()
-    conn.close()
 
 def acknowledge_downtime_event(event_id, technician_id):
-    conn = get_connection()
-    cur = conn.cursor()
     now = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         "UPDATE downtime_events SET technician_id = ?, acknowledged_at = ? WHERE id = ?",
         (technician_id, now, event_id)
     )
-    conn.commit()
-    conn.close()
 
 def resolve_downtime_event(event_id, resolution_notes):
-    conn = get_connection()
-    cur = conn.cursor()
     end_time = datetime.now()
     
     # Fetch start time to calculate duration
-    cur.execute("SELECT start_time FROM downtime_events WHERE id = ?", (event_id,))
-    row = cur.fetchone()
+    row = _fetch_one("SELECT start_time FROM downtime_events WHERE id = ?", (event_id,))
     
     if row:
         start_time = datetime.fromisoformat(row["start_time"])
         duration = (end_time - start_time).total_seconds() / 60.0
         
-        cur.execute(
+        _execute(
             "UPDATE downtime_events SET end_time = ?, duration_minutes = ?, resolution_notes = ? WHERE id = ?",
             (end_time.isoformat(), duration, resolution_notes, event_id),
         )
-        conn.commit()
-    conn.close()
 
 def get_active_maintenance_events():
-    conn = get_connection()
-    # Get all open events, filtered for maintenance if we had categories, but for now all open events
-    # Ideally filtered by "Unplanned" or reasons that need maintenance
     query = """
         SELECT d.*, m.name as machine_name, l.name as line_name, r.description as reason_description, r.code as reason_code,
                o.name as operator_name, t.name as technician_name
@@ -378,51 +478,35 @@ def get_active_maintenance_events():
         WHERE d.end_time IS NULL
         ORDER BY d.start_time ASC
     """
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
+    return _read_df(query)
 
 def get_active_downtime_event(machine_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+    return _fetch_one(
         "SELECT * FROM downtime_events WHERE machine_id = ? AND end_time IS NULL ORDER BY start_time DESC LIMIT 1",
         (machine_id,)
     )
-    row = cur.fetchone()
-    conn.close()
-    return row
 
 def log_quality_event(machine_id, line_id, work_order_id, operator_id, reason_id, quantity, notes=""):
-    conn = get_connection()
-    cur = conn.cursor()
     timestamp = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         """
         INSERT INTO quality_events (machine_id, line_id, work_order_id, operator_id, reason_id, quantity, timestamp, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (machine_id, line_id, work_order_id, operator_id, reason_id, quantity, timestamp, notes)
     )
-    conn.commit()
-    conn.close()
 
 def log_production_count(machine_id, line_id, work_order_id, operator_id, good_quantity, scrap_quantity=0):
-    conn = get_connection()
-    cur = conn.cursor()
     timestamp = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         """
         INSERT INTO production_counts (machine_id, line_id, work_order_id, operator_id, good_quantity, scrap_quantity, timestamp)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (machine_id, line_id, work_order_id, operator_id, good_quantity, scrap_quantity, timestamp)
     )
-    conn.commit()
-    conn.close()
 
 def get_recent_downtime_events(limit=10, machine_id=None):
-    conn = get_connection()
     query = """
         SELECT d.*, r.description as reason_description, o.name as operator_name 
         FROM downtime_events d
@@ -437,12 +521,9 @@ def get_recent_downtime_events(limit=10, machine_id=None):
     query += " ORDER BY start_time DESC LIMIT ?"
     params.append(limit)
     
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 def get_recent_quality_events(limit=10, machine_id=None):
-    conn = get_connection()
     query = """
         SELECT q.*, r.description as reason_description 
         FROM quality_events q
@@ -456,13 +537,10 @@ def get_recent_quality_events(limit=10, machine_id=None):
     query += " ORDER BY timestamp DESC LIMIT ?"
     params.append(limit)
     
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 # For dashboard: Get downtime within a time window
 def get_downtime_summary(start_time_str, end_time_str):
-    conn = get_connection()
     # Simple overlap check: event starts before window ends AND event ends after window starts (or is ongoing)
     # For MVP we can just query start_time between window or something simple
     # The requirement says "whose time intersects the window".
@@ -475,12 +553,9 @@ def get_downtime_summary(start_time_str, end_time_str):
         JOIN downtime_reasons r ON d.reason_id = r.id
         WHERE (d.end_time IS NULL OR d.end_time >= ?) AND d.start_time <= ?
     """
-    df = pd.read_sql(query, conn, params=(start_time_str, end_time_str))
-    conn.close()
-    return df
+    return _read_df(query, params=(start_time_str, end_time_str))
 
 def get_quality_summary(start_time_str, end_time_str):
-    conn = get_connection()
     query = """
         SELECT q.*, m.name as machine_name, l.name as line_name, r.description as reason_description
         FROM quality_events q
@@ -489,12 +564,9 @@ def get_quality_summary(start_time_str, end_time_str):
         JOIN quality_reasons r ON q.reason_id = r.id
         WHERE q.timestamp >= ? AND q.timestamp <= ?
     """
-    df = pd.read_sql(query, conn, params=(start_time_str, end_time_str))
-    conn.close()
-    return df
+    return _read_df(query, params=(start_time_str, end_time_str))
 
 def get_production_summary(start_time_str, end_time_str):
-    conn = get_connection()
     query = """
         SELECT p.*, m.name as machine_name, l.name as line_name
         FROM production_counts p
@@ -502,43 +574,29 @@ def get_production_summary(start_time_str, end_time_str):
         JOIN lines l ON p.line_id = l.id
         WHERE p.timestamp >= ? AND p.timestamp <= ?
     """
-    df = pd.read_sql(query, conn, params=(start_time_str, end_time_str))
-    conn.close()
-    return df
+    return _read_df(query, params=(start_time_str, end_time_str))
 
 def log_safety_incident(line_id, date, description):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+    _execute(
         "INSERT INTO safety_incidents (line_id, date, description) VALUES (?, ?, ?)",
         (line_id, date, description)
     )
-    conn.commit()
-    conn.close()
 
 def get_safety_incidents(line_id, start_date, end_date):
-    conn = get_connection()
     query = "SELECT * FROM safety_incidents WHERE line_id = ? AND date >= ? AND date <= ?"
-    df = pd.read_sql(query, conn, params=(line_id, start_date, end_date))
-    conn.close()
-    return df
+    return _read_df(query, params=(line_id, start_date, end_date))
 
 def create_action(line_id, category, description, assigned_to):
-    conn = get_connection()
-    cur = conn.cursor()
     timestamp = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         """
         INSERT INTO actions (timestamp, line_id, category, description, assigned_to, status)
         VALUES (?, ?, ?, ?, ?, 'open')
         """,
         (timestamp, line_id, category, description, assigned_to)
     )
-    conn.commit()
-    conn.close()
 
 def get_actions(status=None):
-    conn = get_connection()
     query = """
         SELECT a.*, l.name as line_name, o.name as assignee_name 
         FROM actions a
@@ -552,88 +610,59 @@ def get_actions(status=None):
     
     query += " ORDER BY timestamp DESC"
     
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 def close_action(action_id, resolution_notes):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+    _execute(
         "UPDATE actions SET status = 'closed', resolution_notes = ? WHERE id = ?",
         (resolution_notes, action_id)
     )
-    conn.commit()
-    conn.close()
 
 def set_target(line_id, metric_type, value):
-    conn = get_connection()
-    cur = conn.cursor()
-    # Upsert logic (INSERT OR REPLACE)
-    cur.execute(
-        "INSERT OR REPLACE INTO targets (line_id, metric_type, target_value) VALUES (?, ?, ?)",
-        (line_id, metric_type, value)
-    )
-    conn.commit()
-    conn.close()
+    if IS_LAKEBASE:
+        _execute(
+            """
+            INSERT INTO targets (line_id, metric_type, target_value)
+            VALUES (?, ?, ?)
+            ON CONFLICT (line_id, metric_type) DO UPDATE SET target_value = EXCLUDED.target_value
+            """,
+            (line_id, metric_type, value),
+        )
+    else:
+        _execute(
+            "INSERT OR REPLACE INTO targets (line_id, metric_type, target_value) VALUES (?, ?, ?)",
+            (line_id, metric_type, value),
+        )
 
 def get_targets(line_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT metric_type, target_value FROM targets WHERE line_id = ?", (line_id,))
-    rows = cur.fetchall()
-    conn.close()
-    
-    # Return a dictionary of targets
+    rows = _read_df("SELECT metric_type, target_value FROM targets WHERE line_id = ?", params=(line_id,))
     targets = {}
-    for row in rows:
+    for _, row in rows.iterrows():
         targets[row["metric_type"]] = row["target_value"]
     return targets
 
 def add_line(name, description=""):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO lines (name, description) VALUES (?, ?)", (name, description))
-    conn.commit()
-    conn.close()
+    _execute("INSERT INTO lines (name, description) VALUES (?, ?)", (name, description))
 
 def add_machine(name, line_id, description=""):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO machines (name, line_id, description) VALUES (?, ?, ?)", (name, line_id, description))
-    conn.commit()
-    conn.close()
+    _execute("INSERT INTO machines (name, line_id, description) VALUES (?, ?, ?)", (name, line_id, description))
 
 def add_operator(name, badge_id=""):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO operators (name, badge_id) VALUES (?, ?)", (name, badge_id))
-    conn.commit()
-    conn.close()
+    _execute("INSERT INTO operators (name, badge_id) VALUES (?, ?)", (name, badge_id))
 
 def add_downtime_reason(code, description, category):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("INSERT INTO downtime_reasons (code, description, category) VALUES (?, ?, ?)", (code, description, category))
-    conn.commit()
-    conn.close()
+    _execute("INSERT INTO downtime_reasons (code, description, category) VALUES (?, ?, ?)", (code, description, category))
 
 def create_work_order(wo_number, part_number, target_quantity, due_date, line_id, status="Scheduled"):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
+    _execute(
         """
         INSERT INTO work_orders (wo_number, part_number, target_quantity, due_date, line_id, status)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (wo_number, part_number, target_quantity, due_date, line_id, status)
     )
-    conn.commit()
-    conn.close()
 
 def update_work_order_status(wo_id, status):
-    conn = get_connection()
-    cur = conn.cursor()
     update_query = "UPDATE work_orders SET status = ?"
     params = [status]
     
@@ -647,12 +676,9 @@ def update_work_order_status(wo_id, status):
     update_query += " WHERE id = ?"
     params.append(wo_id)
     
-    cur.execute(update_query, params)
-    conn.commit()
-    conn.close()
+    _execute(update_query, params)
 
 def get_inspection_records(wo_id=None):
-    conn = get_connection()
     query = """
         SELECT i.*, o.name as inspector_name, l.name as line_name, w.wo_number
         FROM inspection_records i
@@ -666,55 +692,40 @@ def get_inspection_records(wo_id=None):
         params.append(wo_id)
         
     query += " ORDER BY i.timestamp DESC"
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 def create_inspection_record(work_order_id, line_id, inspector_id, result, measurements="", notes=""):
-    conn = get_connection()
-    cur = conn.cursor()
     timestamp = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         """
         INSERT INTO inspection_records (work_order_id, line_id, inspector_id, result, measurements, timestamp, notes)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         (work_order_id, line_id, inspector_id, result, measurements, timestamp, notes)
     )
-    conn.commit()
-    conn.close()
 
 def get_mrb_items(status=None):
-    conn = get_connection()
     query = "SELECT * FROM mrb_items"
     params = []
     if status:
         query += " WHERE status = ?"
         params.append(status)
     query += " ORDER BY created_at DESC"
-    df = pd.read_sql(query, conn, params=params)
-    conn.close()
-    return df
+    return _read_df(query, params=params)
 
 def create_mrb_item(part_number, quantity, reason, notes="", quality_event_id=None):
-    conn = get_connection()
-    cur = conn.cursor()
     created_at = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         """
         INSERT INTO mrb_items (part_number, quantity, reason, status, notes, created_at, quality_event_id)
         VALUES (?, ?, ?, 'Open', ?, ?, ?)
         """,
         (part_number, quantity, reason, notes, created_at, quality_event_id)
     )
-    conn.commit()
-    conn.close()
 
 def update_mrb_disposition(item_id, disposition, notes=""):
-    conn = get_connection()
-    cur = conn.cursor()
     updated_at = datetime.now().isoformat()
-    cur.execute(
+    _execute(
         """
         UPDATE mrb_items 
         SET status = 'Dispositioned', disposition = ?, notes = ?, updated_at = ?
@@ -722,17 +733,21 @@ def update_mrb_disposition(item_id, disposition, notes=""):
         """,
         (disposition, notes, updated_at, item_id)
     )
-    conn.commit()
-    conn.close()
 
 def seed_db():
     """Populates the database with initial sample data."""
     conn = get_connection()
-    cur = conn.cursor()
+    cursor_kwargs = {}
+    factory = _cursor_factory()
+    if factory:
+        cursor_kwargs["cursor_factory"] = factory
+    cur = conn.cursor(**cursor_kwargs)
 
     # Check if lines exist
-    cur.execute("SELECT COUNT(*) FROM lines")
-    if cur.fetchone()[0] > 0:
+    cur.execute(_prepare_query("SELECT COUNT(*) as cnt FROM lines"))
+    existing = cur.fetchone()
+    existing_count = existing["cnt"] if isinstance(existing, dict) else existing[0]
+    if existing_count > 0:
         conn.close()
         return
 
@@ -741,13 +756,15 @@ def seed_db():
         ("Line_A", "Main Assembly Line"),
         ("Line_B", "Packaging Line"),
     ]
-    cur.executemany("INSERT INTO lines (name, description) VALUES (?, ?)", lines)
+    cur.executemany(_prepare_query("INSERT INTO lines (name, description) VALUES (?, ?)"), lines)
     
     conn.commit()
     
     # Get Line IDs
     cur.execute("SELECT id, name FROM lines")
-    line_map = {row["name"]: row["id"] for row in cur.fetchall()}
+    line_map = {}
+    for row in cur.fetchall():
+        line_map[row["name"]] = row["id"]
 
     # Machines
     machines = [
@@ -755,7 +772,7 @@ def seed_db():
         ("Robot_Arm_1", line_map["Line_A"], "Assembly Robot"),
         ("Packer_1", line_map["Line_B"], "Box Packer"),
     ]
-    cur.executemany("INSERT INTO machines (name, line_id, description) VALUES (?, ?, ?)", machines)
+    cur.executemany(_prepare_query("INSERT INTO machines (name, line_id, description) VALUES (?, ?, ?)"), machines)
 
     # Operators
     operators = [
@@ -763,14 +780,14 @@ def seed_db():
         ("Jane_Smith", "OP002"),
         ("Mike_Johnson", "OP003"),
     ]
-    cur.executemany("INSERT INTO operators (name, badge_id) VALUES (?, ?)", operators)
+    cur.executemany(_prepare_query("INSERT INTO operators (name, badge_id) VALUES (?, ?)"), operators)
 
     # Work Orders
     work_orders = [
         ("WO-1001", "PN-A001", 500, "2023-12-31", line_map["Line_A"]),
         ("WO-1002", "PN-B002", 1000, "2023-12-31", line_map["Line_B"]),
     ]
-    cur.executemany("INSERT INTO work_orders (wo_number, part_number, target_quantity, due_date, line_id) VALUES (?, ?, ?, ?, ?)", work_orders)
+    cur.executemany(_prepare_query("INSERT INTO work_orders (wo_number, part_number, target_quantity, due_date, line_id) VALUES (?, ?, ?, ?, ?)"), work_orders)
 
     # Downtime Reasons
     dt_reasons = [
@@ -780,7 +797,7 @@ def seed_db():
         ("BRK", "Break", "Planned"),
         ("CHG", "Changeover", "Planned"),
     ]
-    cur.executemany("INSERT INTO downtime_reasons (code, description, category) VALUES (?, ?, ?)", dt_reasons)
+    cur.executemany(_prepare_query("INSERT INTO downtime_reasons (code, description, category) VALUES (?, ?, ?)"), dt_reasons)
 
     # Quality Reasons
     q_reasons = [
@@ -789,7 +806,7 @@ def seed_db():
         ("MAT", "Material Defect", "Defect"),
         ("REW", "Rework", "Rework"),
     ]
-    cur.executemany("INSERT INTO quality_reasons (code, description, category) VALUES (?, ?, ?)", q_reasons)
+    cur.executemany(_prepare_query("INSERT INTO quality_reasons (code, description, category) VALUES (?, ?, ?)"), q_reasons)
 
     conn.commit()
     conn.close()

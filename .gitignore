@@ -25,3 +25,6 @@ Thumbs.db
 .idea/
 .vscode/
 
+#databricks
+.databricks/
+secrets_manager.py
