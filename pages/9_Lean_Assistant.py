@@ -26,8 +26,8 @@ with st.sidebar:
         st.rerun()
 
 # --- Setup OpenAI ---
-api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-
+api_key =  os.getenv("OPENAI_API_KEY")
+# st.secrets.get("OPENAI_API_KEY") or
 if not api_key:
     st.warning("⚠️ OPENAI_API_KEY not found. Please add it to `.streamlit/secrets.toml` or environment variables.")
     st.stop()
