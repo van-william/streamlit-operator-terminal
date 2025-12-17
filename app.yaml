@@ -2,3 +2,7 @@ command: ['streamlit', 'run', 'app.py']
 env:
   - name: 'DB_BACKEND'
     value: 'lakebase'
+  - name: 'OPENAI_API_KEY'
+    valueFrom: 'OPENAI_API_KEY'
+  - name: 'TAVILY_API_KEY'
+    valueFrom: 'TAVILY_API_KEY'

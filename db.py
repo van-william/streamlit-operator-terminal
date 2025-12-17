@@ -99,10 +99,25 @@ def _prepare_query(query: str) -> str:
     return query
 
 
+def _normalize_params(params: Optional[Iterable[Any]]) -> list:
+    """Convert numpy/pandas scalar types to native Python scalars for DB adapters."""
+    if params is None:
+        return []
+    normalized = []
+    for value in params:
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:  # noqa: BLE001 - best-effort fallback
+                pass
+        normalized.append(value)
+    return normalized
+
+
 def _read_df(query: str, params: Optional[Iterable[Any]] = None) -> pd.DataFrame:
     conn = get_connection()
     sql = _prepare_query(query)
-    df = pd.read_sql(sql, conn, params=params)
+    df = pd.read_sql(sql, conn, params=_normalize_params(params))
     conn.close()
     return df
 
@@ -114,7 +129,7 @@ def _fetch_one(query: str, params: Optional[Iterable[Any]] = None):
     if factory:
         cursor_kwargs["cursor_factory"] = factory
     cur = conn.cursor(**cursor_kwargs)
-    cur.execute(_prepare_query(query), params or [])
+    cur.execute(_prepare_query(query), _normalize_params(params))
     row = cur.fetchone()
     conn.close()
     return row
@@ -123,7 +138,7 @@ def _fetch_one(query: str, params: Optional[Iterable[Any]] = None):
 def _execute(query: str, params: Optional[Iterable[Any]] = None):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute(_prepare_query(query), params or [])
+    cur.execute(_prepare_query(query), _normalize_params(params))
     conn.commit()
     conn.close()
 
@@ -140,7 +155,7 @@ def _execute_returning_id(query: str, params: Optional[Iterable[Any]] = None) ->
     if IS_LAKEBASE and "returning" not in sql.lower():
         sql = sql.rstrip().rstrip(";") + " RETURNING id"
 
-    cur.execute(sql, params or [])
+    cur.execute(sql, _normalize_params(params))
     if IS_LAKEBASE:
         row = cur.fetchone()
         if isinstance(row, dict):
@@ -157,7 +172,8 @@ def _execute_returning_id(query: str, params: Optional[Iterable[Any]] = None) ->
 def _executemany(query: str, seq_of_params: Iterable[Iterable[Any]]):
     conn = get_connection()
     cur = conn.cursor()
-    cur.executemany(_prepare_query(query), seq_of_params)
+    normalized = [_normalize_params(params) for params in seq_of_params]
+    cur.executemany(_prepare_query(query), normalized)
     conn.commit()
     conn.close()
 

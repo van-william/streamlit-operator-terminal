@@ -13,14 +13,10 @@ to provide grounded answers with citations.
 
 # --- Sidebar Configuration ---
 with st.sidebar:
-    st.header("Settings")
-    
+    st.header("Settings")    
     # API Keys
     openai_api_key = os.getenv("OPENAI_API_KEY") # or st.secrets.get("OPENAI_API_KEY")
     tavily_api_key = os.getenv("TAVILY_API_KEY") # or st.secrets.get("TAVILY_API_KEY")
-    
-    if not tavily_api_key:
-        tavily_api_key = st.text_input("Tavily API Key", type="password")
         
     # Domains to Search
     default_domains = [
