@@ -221,8 +221,8 @@ if active_downtime_id:
             st.rerun()
         
         # Auto-refresh mechanism for timer
-        time.sleep(5)
-        st.rerun()
+        # time.sleep(5)
+        # st.rerun()
 
 else:
     # RUNNING STATE

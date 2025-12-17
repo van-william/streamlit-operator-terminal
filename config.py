@@ -14,6 +14,7 @@ SHIFTS = {
 # Default to SQLite for local/dev; switch to Lakebase via env.
 DB_BACKEND = os.getenv("DB_BACKEND", "sqlite").lower()
 DB_NAME = os.getenv("DB_NAME", "andon.db")
+ANDON_SCHEMA = os.getenv("ANDON_SCHEMA", "andon")
 
 # Lakebase / Postgres connection (provided automatically in Databricks Apps)
 PG_HOST = os.getenv("PGHOST")

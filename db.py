@@ -6,12 +6,12 @@ from typing import Any, Iterable, Optional
 import pandas as pd
 
 from config import (
+    ANDON_SCHEMA,
     DB_BACKEND,
     DB_NAME,
     PG_APPNAME,
     PG_DATABASE,
     PG_HOST,
-    PG_PASSWORD,
     PG_PORT,
     PG_SSLMODE,
     PG_USER,
@@ -42,15 +42,22 @@ def _cursor_factory():
 
 def _lakebase_password():
     """
-    Resolve password for Lakebase.
-    Prefer PGPASSWORD; if absent, fall back to Databricks OAuth token via WorkspaceClient.
+    Resolve password for Lakebase using Databricks OAuth token.
+    PGPASSWORD is intentionally not used; we rely on token auth.
     """
-    if PG_PASSWORD:
-        return PG_PASSWORD
     if WorkspaceClient is None:
-        raise RuntimeError("PGPASSWORD is missing and databricks-sdk is not installed for token auth.")
+        raise RuntimeError("databricks-sdk is required for Lakebase token authentication.")
     client = WorkspaceClient()
     return client.config.oauth_token().access_token
+
+
+def _ensure_schema(conn):
+    """Create and set search_path to the configured schema for Lakebase."""
+    if not IS_LAKEBASE or not ANDON_SCHEMA:
+        return
+    with conn.cursor() as cur:
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{ANDON_SCHEMA}"')
+        cur.execute(f'SET search_path TO "{ANDON_SCHEMA}"')
 
 
 def get_connection():
@@ -68,7 +75,7 @@ def get_connection():
         if missing:
             raise RuntimeError(f"Missing Lakebase environment variables: {', '.join(missing)}")
         password = _lakebase_password()
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             host=PG_HOST,
             port=PG_PORT,
             dbname=PG_DATABASE,
@@ -77,6 +84,8 @@ def get_connection():
             sslmode=PG_SSLMODE,
             application_name=PG_APPNAME,
         )
+        _ensure_schema(conn)
+        return conn
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
